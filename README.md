@@ -84,11 +84,13 @@ environment:
   QB_PASSWORD: "your-password"       # WebUI password
 ```
 
-### 3. Build and start
+### 3. Start
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
+
+The image is pulled automatically from `ghcr.io/adamdevlpmnt/vault-tracker:latest`.
 
 ### 4. Check logs
 
@@ -145,12 +147,12 @@ Then update `docker-compose.yml` to use it:
 ```yaml
 services:
   vault-tracker:
-    build: .
+    image: ghcr.io/adamdevlpmnt/vault-tracker:latest
     container_name: vault-tracker
     restart: unless-stopped
     env_file: .env
     volumes:
-      - vault-tracker-data:/data
+      - /mnt/TANK/Config/Vault-Tracker:/data
 ```
 
 ---

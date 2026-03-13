@@ -1,6 +1,6 @@
 services:
   vault-tracker:
-    build: .
+    image: ghcr.io/adamdevlpmnt/vault-tracker:latest
     container_name: vault-tracker
     restart: unless-stopped
     volumes:
