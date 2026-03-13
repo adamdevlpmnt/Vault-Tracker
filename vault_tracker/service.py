@@ -6,10 +6,12 @@ Lifecycle:
     3. Enter polling loop:
        a. Fetch all torrents.
        b. Detect new torrents (not yet in our known set).
-       c. For each new torrent, check if it has private trackers.
-       d. Strip & save private trackers immediately.
-       e. For torrents in "uploading" / "stalledUP" / "forcedUP" / "queuedUP" state,
-          reinject any pending trackers from the database.
+       c. For each new torrent:
+          - Fetch torrent properties → check is_private flag.
+          - If private: save ALL tracker URLs to DB, then strip them ALL.
+          - Fallback: if properties don't have the flag, check URLs for
+            passkey/authkey heuristics.
+       d. For torrents in seeding state, reinject pending trackers from DB.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
-from typing import Any, Dict, Set
+from typing import Any, Dict, List, Set
 
 from vault_tracker.config import Config
 from vault_tracker.database import TrackerDB
@@ -32,6 +34,7 @@ SEEDING_STATES = frozenset({
     "stalledUP",      # seeding but no peers
     "forcedUP",       # force-seeding
     "queuedUP",       # queued for seeding
+    "checkingUP",     # checking after download complete
 })
 
 # States that mean "still downloading"
@@ -54,7 +57,7 @@ class VaultService:
         self._db = TrackerDB(cfg.DB_PATH)
         self._qb = QBittorrentClient(cfg)
         self._known_hashes: Set[str] = set()
-        self._downloading_logged: Set[str] = set()  # track download-in-progress logs
+        self._downloading_logged: Set[str] = set()
         self._running = True
 
         # Graceful shutdown
@@ -127,6 +130,31 @@ class VaultService:
             if t and t.get("state") in SEEDING_STATES:
                 self._reinject_trackers(thash, t.get("name", "?"))
 
+    # ── private torrent detection ─────────────────────────────────────
+
+    def _is_torrent_private(self, thash: str, tname: str, trackers: List[Dict[str, Any]]) -> bool:
+        """Determine if a torrent is private using multiple methods:
+        1. torrent properties is_private flag (authoritative)
+        2. Fallback: URL-based heuristics on tracker URLs
+        """
+        # Method 1: Check the is_private flag via torrent properties
+        try:
+            props = self._qb.get_torrent_properties(thash)
+            if QBittorrentClient.is_private_torrent(props):
+                log.info('🔍 Private tracker check for "%s" → private (is_private=true)', tname)
+                return True
+        except QBittorrentError as exc:
+            log.warning('⚠️  Could not fetch properties for "%s": %s — falling back to URL check', tname, exc)
+
+        # Method 2: Check tracker URLs for passkey/authkey patterns
+        for tracker in trackers:
+            if QBittorrentClient.has_private_tracker_url(tracker):
+                log.info('🔍 Private tracker check for "%s" → private (passkey detected in URL)', tname)
+                return True
+
+        log.info('🔍 Private tracker check for "%s" → public', tname)
+        return False
+
     # ── new torrent processing ────────────────────────────────────────
 
     def _process_new_torrent(self, torrent: Dict[str, Any]) -> None:
@@ -140,37 +168,29 @@ class VaultService:
             log.info('   ↳ Already processed in database — skipping')
             return
 
+        # Fetch tracker list
         try:
             trackers = self._qb.get_torrent_trackers(thash)
         except QBittorrentError as exc:
             log.error('❌ Failed to fetch trackers for "%s": %s', tname, exc)
             return
 
-        # Filter out qBittorrent internal entries (DHT, PeX, LSD)
-        real_trackers = [
-            t for t in trackers
-            if t.get("url", "").startswith(("http://", "https://", "udp://"))
-        ]
+        # Keep only real tracker URLs (exclude DHT, PeX, LSD)
+        real_trackers = QBittorrentClient.get_real_trackers(trackers)
 
         if not real_trackers:
-            log.info('🔍 Private tracker check for "%s" → public (no real trackers)', tname)
+            log.info('🔍 Private tracker check for "%s" → public (no tracker URLs)', tname)
             return
 
-        private_trackers = [t for t in real_trackers if QBittorrentClient.is_private_tracker(t)]
-
-        if not private_trackers:
-            log.info('🔍 Private tracker check for "%s" → public', tname)
+        # Check if the torrent is private
+        if not self._is_torrent_private(thash, tname, real_trackers):
             return
 
-        log.info(
-            '🔍 Private tracker check for "%s" → private (%d tracker(s))',
-            tname,
-            len(private_trackers),
-        )
+        # ── PRIVATE TORRENT: save ALL trackers to DB, then strip ALL ──
+        log.info('   ↳ %d tracker URL(s) to save and strip', len(real_trackers))
 
-        # Save & strip each private tracker
         urls_to_strip = []
-        for tracker in private_trackers:
+        for tracker in real_trackers:
             url = tracker["url"]
             tier = tracker.get("tier", 0)
             masked = QBittorrentClient.mask_url(url)
@@ -182,11 +202,11 @@ class VaultService:
                 log.info("💾 Tracker URL already in database: %s → ✅ OK (duplicate)", masked)
             urls_to_strip.append(url)
 
-        # Strip all at once
+        # Strip all trackers at once
         if urls_to_strip:
             try:
                 self._qb.remove_trackers(thash, urls_to_strip)
-                log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK', tname)
+                log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK (%d removed)', tname, len(urls_to_strip))
             except QBittorrentError as exc:
                 log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
 
@@ -214,7 +234,7 @@ class VaultService:
     def run(self) -> None:
         """Main entry point — connect, recover, poll forever."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v1.0.0 starting")
+        log.info("🚀 Vault-Tracker v1.1.0 starting")
         log.info("   Config: %s", self._cfg)
         log.info("=" * 60)
 

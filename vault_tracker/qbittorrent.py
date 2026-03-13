@@ -88,6 +88,13 @@ class QBittorrentClient:
         resp = self._request("GET", "torrents/info")
         return resp.json()
 
+    def get_torrent_properties(self, torrent_hash: str) -> Dict[str, Any]:
+        """Return torrent properties (includes is_private flag)."""
+        resp = self._request(
+            "GET", "torrents/properties", params={"hash": torrent_hash}
+        )
+        return resp.json()
+
     def get_torrent_trackers(self, torrent_hash: str) -> List[Dict[str, Any]]:
         """Return tracker list for a torrent."""
         resp = self._request(
@@ -114,24 +121,29 @@ class QBittorrentClient:
     # ── helpers ───────────────────────────────────────────────────────
 
     @staticmethod
-    def is_private_tracker(tracker: Dict[str, Any]) -> bool:
-        """Heuristic: a tracker is private if its message or status indicates so,
-        or the URL contains a passkey / authkey / pid / torrent_pass / secure param."""
-        url = tracker.get("url", "")
-        # qBittorrent status codes: 0=disabled, 1=not contacted, 2=working, 3=updating, 4=not working
-        # msg field may contain "This torrent is private"
+    def is_private_torrent(properties: Dict[str, Any]) -> bool:
+        """Check the is_private flag from torrent properties.
+        This is the authoritative way — set by the torrent metadata itself."""
+        return bool(properties.get("is_private", False))
 
-        # Check URL for private-tracker tell-tales
-        lower_url = url.lower()
+    @staticmethod
+    def has_private_tracker_url(tracker: Dict[str, Any]) -> bool:
+        """Heuristic fallback: check if a tracker URL contains auth parameters."""
+        url = tracker.get("url", "").lower()
         private_params = [
             "passkey=", "authkey=", "torrent_pass=", "pid=",
             "secure=", "auth=", "key=", "user=",
         ]
-        for param in private_params:
-            if param in lower_url:
-                return True
+        return any(param in url for param in private_params)
 
-        return False
+    @staticmethod
+    def get_real_trackers(trackers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Filter out qBittorrent internal entries (DHT, PeX, LSD).
+        Only keep actual HTTP/HTTPS/UDP tracker URLs."""
+        return [
+            t for t in trackers
+            if t.get("url", "").startswith(("http://", "https://", "udp://"))
+        ]
 
     @staticmethod
     def mask_url(url: str) -> str:
@@ -140,21 +152,34 @@ class QBittorrentClient:
         Example:
             https://tracker.example.com/ann?passkey=abc123def456
             → https://tracker.example.com/ann?passkey=abc***456
+
+        URLs without query params get their path partially masked if it
+        looks like it contains a key (long alphanumeric segments).
         """
         parsed = urlparse(url)
-        if not parsed.query:
-            return url
-        # Mask each parameter value
-        pairs = parsed.query.split("&")
-        masked = []
-        for pair in pairs:
-            if "=" in pair:
-                key, val = pair.split("=", 1)
-                if len(val) > 6:
-                    val = val[:3] + "***" + val[-3:]
+
+        if parsed.query:
+            # Mask query parameter values
+            pairs = parsed.query.split("&")
+            masked = []
+            for pair in pairs:
+                if "=" in pair:
+                    key, val = pair.split("=", 1)
+                    if len(val) > 6:
+                        val = val[:3] + "***" + val[-3:]
+                    else:
+                        val = "***"
+                    masked.append(f"{key}={val}")
                 else:
-                    val = "***"
-                masked.append(f"{key}={val}")
-            else:
-                masked.append(pair)
-        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(masked)}"
+                    masked.append(pair)
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(masked)}"
+
+        # For URLs with keys embedded in the path (e.g. /announce/abc123def456)
+        path = parsed.path
+        parts = path.rsplit("/", 1)
+        if len(parts) == 2 and len(parts[1]) > 8:
+            segment = parts[1]
+            masked_segment = segment[:3] + "***" + segment[-3:]
+            path = parts[0] + "/" + masked_segment
+
+        return f"{parsed.scheme}://{parsed.netloc}{path}"
