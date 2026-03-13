@@ -1,7 +1,10 @@
 FROM python:3.12-slim
 
 LABEL maintainer="Vault-Tracker" \
-      description="Private tracker passkey protector for qBittorrent"
+      description="Private tracker passkey protector for qBittorrent" \
+      org.opencontainers.image.source="https://github.com/adamdevlpmnt/Vault-Tracker" \
+      org.opencontainers.image.description="Private tracker passkey protector for qBittorrent" \
+      org.opencontainers.image.licenses="MIT"
 
 # Prevent Python from buffering stdout/stderr (important for docker logs)
 ENV PYTHONUNBUFFERED=1
