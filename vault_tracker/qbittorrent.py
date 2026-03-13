@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 import requests
@@ -89,13 +88,6 @@ class QBittorrentClient:
         resp = self._request("GET", "torrents/info")
         return resp.json()
 
-    def get_torrent_properties(self, torrent_hash: str) -> Dict[str, Any]:
-        """Return torrent properties."""
-        resp = self._request(
-            "GET", "torrents/properties", params={"hash": torrent_hash}
-        )
-        return resp.json()
-
     def get_torrent_trackers(self, torrent_hash: str) -> List[Dict[str, Any]]:
         """Return tracker list for a torrent."""
         resp = self._request(
@@ -119,37 +111,7 @@ class QBittorrentClient:
             data={"hash": torrent_hash, "urls": "|".join(urls)},
         )
 
-    # ── private detection ─────────────────────────────────────────────
-
-    @staticmethod
-    def is_private_from_info(torrent: Dict[str, Any]) -> Optional[bool]:
-        """Check the is_private / isPrivate field from torrents/info.
-        Available since qBittorrent 5.0. Returns None if field is absent."""
-        # Try both field names (API inconsistency between versions)
-        for key in ("is_private", "isPrivate", "private"):
-            if key in torrent:
-                return bool(torrent[key])
-        return None
-
-    @staticmethod
-    def is_private_from_properties(props: Dict[str, Any]) -> Optional[bool]:
-        """Check the private flag from torrents/properties.
-        Field name varies between qBittorrent versions."""
-        for key in ("isPrivate", "is_private", "private"):
-            if key in props:
-                return bool(props[key])
-        return None
-
-    @staticmethod
-    def is_private_from_tracker_messages(trackers: List[Dict[str, Any]]) -> bool:
-        """Check if any tracker's message says 'private'.
-        qBittorrent DHT/PeX/LSD entries show 'Ce torrent est privé'
-        or 'This torrent is private' for private torrents."""
-        for t in trackers:
-            msg = t.get("msg", "").lower()
-            if "private" in msg or "privé" in msg or "privee" in msg:
-                return True
-        return False
+    # ── helpers ───────────────────────────────────────────────────────
 
     @staticmethod
     def get_real_trackers(trackers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -185,7 +147,7 @@ class QBittorrentClient:
                     masked.append(pair)
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(masked)}"
 
-        # Mask long hex/alphanum segments in path (keys embedded in path)
+        # Mask long segments in path (keys embedded in path)
         path = parsed.path
         parts = path.rsplit("/", 1)
         if len(parts) == 2 and len(parts[1]) > 8:

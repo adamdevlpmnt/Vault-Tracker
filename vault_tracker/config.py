@@ -27,9 +27,6 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
-    # Behaviour
-    STRIP_PUBLIC_TRACKERS: bool = os.getenv("STRIP_PUBLIC_TRACKERS", "false").lower() == "true"
-
     @property
     def qb_url(self) -> str:
         """Full base URL for the qBittorrent WebUI API."""

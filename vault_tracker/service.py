@@ -1,18 +1,11 @@
 """Core Vault-Tracker service — the main polling loop.
 
-Lifecycle:
-    1. Connect to qBittorrent (retry until reachable).
-    2. On restart, scan database for pending reinjections and process them.
-    3. Enter polling loop:
-       a. Fetch all torrents.
-       b. Detect new torrents (not yet in our known set).
-       c. For each new torrent, determine if it's private using
-          multiple detection methods (in order):
-            i.   is_private field from torrents/info (qBittorrent >= 5.0)
-            ii.  isPrivate / private field from torrents/properties
-            iii. DHT/PeX/LSD message containing "private" / "privé"
-       d. If private: save ALL tracker URLs to DB, then strip them ALL.
-       e. For torrents in seeding state, reinject pending trackers from DB.
+Simple logic:
+    - Torrent is downloading → save its tracker URLs to DB, strip them.
+    - Torrent is seeding     → reinject saved tracker URLs from DB.
+    - On restart             → check DB for pending reinjections.
+
+No private/public detection. Every torrent with tracker URLs gets processed.
 """
 
 from __future__ import annotations
@@ -20,7 +13,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Set
 
 from vault_tracker.config import Config
 from vault_tracker.database import TrackerDB
@@ -29,16 +22,16 @@ from vault_tracker.qbittorrent import QBittorrentClient, QBittorrentError
 
 log = get_logger()
 
-# qBittorrent states that mean "finished downloading and seeding"
+# qBittorrent states: seeding (download complete)
 SEEDING_STATES = frozenset({
-    "uploading",      # actively seeding
-    "stalledUP",      # seeding but no peers
-    "forcedUP",       # force-seeding
-    "queuedUP",       # queued for seeding
-    "checkingUP",     # checking after download complete
+    "uploading",
+    "stalledUP",
+    "forcedUP",
+    "queuedUP",
+    "checkingUP",
 })
 
-# States that mean "still downloading"
+# qBittorrent states: still downloading
 DOWNLOADING_STATES = frozenset({
     "downloading",
     "stalledDL",
@@ -57,11 +50,9 @@ class VaultService:
         self._cfg = cfg
         self._db = TrackerDB(cfg.DB_PATH)
         self._qb = QBittorrentClient(cfg)
-        self._known_hashes: Set[str] = set()
-        self._downloading_logged: Set[str] = set()
+        self._known_hashes: Set[str] = set()  # torrents we've already processed
         self._running = True
 
-        # Graceful shutdown
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -69,7 +60,7 @@ class VaultService:
         log.info("🛑 Received signal %s — shutting down gracefully…", signum)
         self._running = False
 
-    # ── connection with retry ─────────────────────────────────────────
+    # ── connection ────────────────────────────────────────────────────
 
     def _connect(self) -> None:
         """Block until qBittorrent is reachable."""
@@ -81,29 +72,24 @@ class VaultService:
                 return
             except QBittorrentError:
                 if self._cfg.MAX_RETRIES and attempt >= self._cfg.MAX_RETRIES:
-                    log.error(
-                        "⚠️  qBittorrent unreachable after %d attempts — giving up",
-                        attempt,
-                    )
+                    log.error("⚠️  qBittorrent unreachable after %d attempts — giving up", attempt)
                     sys.exit(1)
                 log.warning(
                     "⚠️  qBittorrent unreachable → retrying in %ds (attempt %d)",
-                    self._cfg.RETRY_DELAY,
-                    attempt,
+                    self._cfg.RETRY_DELAY, attempt,
                 )
                 time.sleep(self._cfg.RETRY_DELAY)
 
     # ── startup recovery ──────────────────────────────────────────────
 
     def _recover_pending(self) -> None:
-        """On restart, list all pending reinjections and process any whose
-        torrents are already seeding."""
+        """On restart, check DB for pending reinjections and process
+        any whose torrents are already seeding."""
         pending = self._db.get_all_pending()
         if not pending:
             log.info("🔁 Container restart → no pending reinjections in database")
             return
 
-        # Group by torrent
         by_hash: Dict[str, list] = {}
         for thash, tname, turl, tier in pending:
             by_hash.setdefault(thash, []).append((tname, turl, tier))
@@ -114,10 +100,8 @@ class VaultService:
             len(by_hash),
         )
         for thash, items in by_hash.items():
-            name = items[0][0]
-            log.info("    ├── %s [hash: %s] — %d tracker(s)", name, thash[:8], len(items))
+            log.info("    ├── %s [hash: %s] — %d tracker(s)", items[0][0], thash[:8], len(items))
 
-        # Try to reinject any that are already seeding
         try:
             torrents = self._qb.get_torrents()
         except QBittorrentError:
@@ -131,90 +115,34 @@ class VaultService:
             if t and t.get("state") in SEEDING_STATES:
                 self._reinject_trackers(thash, t.get("name", "?"))
 
-    # ── private torrent detection (multi-method) ──────────────────────
+    # ── strip trackers (on download) ──────────────────────────────────
 
-    def _is_torrent_private(
-        self,
-        torrent: Dict[str, Any],
-        thash: str,
-        tname: str,
-        all_trackers: List[Dict[str, Any]],
-    ) -> bool:
-        """Determine if a torrent is private using multiple methods.
-
-        Checks (in order, stops at first definitive answer):
-        1. is_private field from torrents/info  (qBittorrent >= 5.0)
-        2. private / isPrivate from torrents/properties
-        3. DHT/PeX/LSD message containing "private" / "privé"
-        """
-
-        # ── Method 1: torrents/info field (fastest, no extra API call) ──
-        result = QBittorrentClient.is_private_from_info(torrent)
-        if result is True:
-            log.info('🔍 Private tracker check for "%s" → private (is_private flag in torrent info)', tname)
-            return True
-        if result is False:
-            log.info('🔍 Private tracker check for "%s" → public (is_private=false in torrent info)', tname)
-            return False
-
-        # ── Method 2: torrents/properties (extra API call) ──
-        try:
-            props = self._qb.get_torrent_properties(thash)
-            log.debug("   Properties keys for debug: %s", list(props.keys()))
-            result = QBittorrentClient.is_private_from_properties(props)
-            if result is True:
-                log.info('🔍 Private tracker check for "%s" → private (flag in torrent properties)', tname)
-                return True
-            if result is False:
-                log.info('🔍 Private tracker check for "%s" → public (flag=false in torrent properties)', tname)
-                return False
-        except QBittorrentError as exc:
-            log.warning('⚠️  Could not fetch properties for "%s": %s', tname, exc)
-
-        # ── Method 3: DHT/PeX/LSD messages ──
-        # qBittorrent shows "Ce torrent est privé" or "This torrent is private"
-        # in the message column of internal tracker entries (** [DHT] **, etc.)
-        if QBittorrentClient.is_private_from_tracker_messages(all_trackers):
-            log.info('🔍 Private tracker check for "%s" → private (DHT/PeX message says private)', tname)
-            return True
-
-        log.info('🔍 Private tracker check for "%s" → public (no private indicators found)', tname)
-        return False
-
-    # ── new torrent processing ────────────────────────────────────────
-
-    def _process_new_torrent(self, torrent: Dict[str, Any]) -> None:
-        """Handle a freshly detected torrent."""
+    def _strip_trackers(self, torrent: Dict[str, Any]) -> None:
+        """Save and strip all tracker URLs from a downloading torrent."""
         thash = torrent["hash"]
         tname = torrent.get("name", "unknown")
-        log.info('🆕 New torrent detected: "%s" [hash: %s]', tname, thash[:8])
 
-        # Skip if we already have records for this torrent (e.g. re-added)
+        log.info('🆕 New downloading torrent detected: "%s" [hash: %s]', tname, thash[:8])
+
+        # Already processed?
         if self._db.has_records(thash):
             log.info('   ↳ Already processed in database — skipping')
             return
 
-        # Fetch ALL tracker entries (including DHT/PeX/LSD — needed for message check)
+        # Fetch trackers
         try:
             all_trackers = self._qb.get_torrent_trackers(thash)
         except QBittorrentError as exc:
             log.error('❌ Failed to fetch trackers for "%s": %s', tname, exc)
             return
 
-        # Real trackers = only HTTP/HTTPS/UDP (not DHT/PeX/LSD)
         real_trackers = QBittorrentClient.get_real_trackers(all_trackers)
 
         if not real_trackers:
-            log.info('🔍 Private tracker check for "%s" → skipped (no tracker URLs)', tname)
+            log.info('   ↳ No tracker URLs found — nothing to strip')
             return
 
-        # Multi-method private detection
-        if not self._is_torrent_private(torrent, thash, tname, all_trackers):
-            return
-
-        # ── PRIVATE TORRENT: save ALL real trackers to DB, then strip ALL ──
-        log.info('   ↳ %d tracker URL(s) to save and strip', len(real_trackers))
-
+        # Save each tracker URL to database
         urls_to_strip = []
         for tracker in real_trackers:
             url = tracker["url"]
@@ -228,15 +156,14 @@ class VaultService:
                 log.info("💾 Tracker URL already in database: %s → ✅ OK (duplicate)", masked)
             urls_to_strip.append(url)
 
-        # Strip all trackers at once
-        if urls_to_strip:
-            try:
-                self._qb.remove_trackers(thash, urls_to_strip)
-                log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK (%d removed)', tname, len(urls_to_strip))
-            except QBittorrentError as exc:
-                log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
+        # Strip all at once
+        try:
+            self._qb.remove_trackers(thash, urls_to_strip)
+            log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK (%d removed)', tname, len(urls_to_strip))
+        except QBittorrentError as exc:
+            log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
 
-    # ── tracker reinjection ───────────────────────────────────────────
+    # ── reinject trackers (on seeding) ────────────────────────────────
 
     def _reinject_trackers(self, thash: str, tname: str) -> None:
         """Reinject all saved trackers for a torrent that has entered seeding state."""
@@ -258,9 +185,9 @@ class VaultService:
     # ── main loop ─────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Main entry point — connect, recover, poll forever."""
+        """Main entry point."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v1.2.0 starting")
+        log.info("🚀 Vault-Tracker v2.0.0 starting")
         log.info("   Config: %s", self._cfg)
         log.info("=" * 60)
 
@@ -286,30 +213,23 @@ class VaultService:
                 tname = torrent.get("name", "unknown")
                 state = torrent.get("state", "unknown")
 
-                # New torrent detection
-                if thash not in self._known_hashes:
+                # ── Downloading: strip trackers ──
+                if state in DOWNLOADING_STATES and thash not in self._known_hashes:
                     self._known_hashes.add(thash)
-                    self._process_new_torrent(torrent)
+                    self._strip_trackers(torrent)
 
-                # Log download progress (once per torrent)
-                if state in DOWNLOADING_STATES and thash not in self._downloading_logged:
-                    progress = torrent.get("progress", 0) * 100
-                    log.info(
-                        '⏳ Torrent download in progress: "%s" [%.1f%%] — state: %s',
-                        tname,
-                        progress,
-                        state,
-                    )
-                    self._downloading_logged.add(thash)
-
-                # Seeding → reinject
-                if state in SEEDING_STATES:
-                    self._downloading_logged.discard(thash)
+                # ── Seeding: reinject trackers ──
+                elif state in SEEDING_STATES:
+                    if thash not in self._known_hashes:
+                        self._known_hashes.add(thash)  # already seeding, just mark known
                     if self._db.get_pending(thash):
                         self._reinject_trackers(thash, tname)
 
+                # ── Other states: just mark as known ──
+                elif thash not in self._known_hashes:
+                    self._known_hashes.add(thash)
+
             time.sleep(self._cfg.POLL_INTERVAL)
 
-        # Cleanup
         log.info("🛑 Vault-Tracker stopped.")
         self._db.close()
