@@ -1,31 +1,17 @@
-version: "3.8"
-
 services:
   vault-tracker:
     build: .
     container_name: vault-tracker
     restart: unless-stopped
     volumes:
-      # Persistent database — survives container restarts / rebuilds
-      - vault-tracker-data:/data
+      - /mnt/TANK/Config/Vault-Tracker:/data
     environment:
-      # ─── qBittorrent connection ───────────────────────────────────
-      QB_HOST: "http://192.168.1.100"   # Your qBittorrent host (IP or hostname)
-      QB_PORT: "8080"                    # WebUI port
-      QB_USERNAME: "admin"               # WebUI username
-      QB_PASSWORD: "adminadmin"          # WebUI password
-
-      # ─── Polling & retry ──────────────────────────────────────────
-      POLL_INTERVAL: "10"                # Seconds between each polling cycle
-      RETRY_DELAY: "30"                  # Seconds to wait before retrying on failure
-      MAX_RETRIES: "0"                   # 0 = retry forever
-
-      # ─── Database ─────────────────────────────────────────────────
-      DB_PATH: "/data/vault-tracker.db"  # Path inside the container
-
-      # ─── Logging ──────────────────────────────────────────────────
-      LOG_LEVEL: "INFO"                  # DEBUG, INFO, WARNING, ERROR
-
-volumes:
-  vault-tracker-data:
-    driver: local
+      QB_HOST: "http://192.168.1.100"
+      QB_PORT: "8080"
+      QB_USERNAME: "admin"
+      QB_PASSWORD: "adminadmin"
+      POLL_INTERVAL: "10"
+      RETRY_DELAY: "30"
+      MAX_RETRIES: "0"
+      DB_PATH: "/data/vault-tracker.db"
+      LOG_LEVEL: "INFO"
