@@ -6,12 +6,13 @@ Lifecycle:
     3. Enter polling loop:
        a. Fetch all torrents.
        b. Detect new torrents (not yet in our known set).
-       c. For each new torrent:
-          - Fetch torrent properties → check is_private flag.
-          - If private: save ALL tracker URLs to DB, then strip them ALL.
-          - Fallback: if properties don't have the flag, check URLs for
-            passkey/authkey heuristics.
-       d. For torrents in seeding state, reinject pending trackers from DB.
+       c. For each new torrent, determine if it's private using
+          multiple detection methods (in order):
+            i.   is_private field from torrents/info (qBittorrent >= 5.0)
+            ii.  isPrivate / private field from torrents/properties
+            iii. DHT/PeX/LSD message containing "private" / "privé"
+       d. If private: save ALL tracker URLs to DB, then strip them ALL.
+       e. For torrents in seeding state, reinject pending trackers from DB.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from __future__ import annotations
 import signal
 import sys
 import time
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Optional, Set
 
 from vault_tracker.config import Config
 from vault_tracker.database import TrackerDB
@@ -130,29 +131,54 @@ class VaultService:
             if t and t.get("state") in SEEDING_STATES:
                 self._reinject_trackers(thash, t.get("name", "?"))
 
-    # ── private torrent detection ─────────────────────────────────────
+    # ── private torrent detection (multi-method) ──────────────────────
 
-    def _is_torrent_private(self, thash: str, tname: str, trackers: List[Dict[str, Any]]) -> bool:
-        """Determine if a torrent is private using multiple methods:
-        1. torrent properties is_private flag (authoritative)
-        2. Fallback: URL-based heuristics on tracker URLs
+    def _is_torrent_private(
+        self,
+        torrent: Dict[str, Any],
+        thash: str,
+        tname: str,
+        all_trackers: List[Dict[str, Any]],
+    ) -> bool:
+        """Determine if a torrent is private using multiple methods.
+
+        Checks (in order, stops at first definitive answer):
+        1. is_private field from torrents/info  (qBittorrent >= 5.0)
+        2. private / isPrivate from torrents/properties
+        3. DHT/PeX/LSD message containing "private" / "privé"
         """
-        # Method 1: Check the is_private flag via torrent properties
+
+        # ── Method 1: torrents/info field (fastest, no extra API call) ──
+        result = QBittorrentClient.is_private_from_info(torrent)
+        if result is True:
+            log.info('🔍 Private tracker check for "%s" → private (is_private flag in torrent info)', tname)
+            return True
+        if result is False:
+            log.info('🔍 Private tracker check for "%s" → public (is_private=false in torrent info)', tname)
+            return False
+
+        # ── Method 2: torrents/properties (extra API call) ──
         try:
             props = self._qb.get_torrent_properties(thash)
-            if QBittorrentClient.is_private_torrent(props):
-                log.info('🔍 Private tracker check for "%s" → private (is_private=true)', tname)
+            log.debug("   Properties keys for debug: %s", list(props.keys()))
+            result = QBittorrentClient.is_private_from_properties(props)
+            if result is True:
+                log.info('🔍 Private tracker check for "%s" → private (flag in torrent properties)', tname)
                 return True
+            if result is False:
+                log.info('🔍 Private tracker check for "%s" → public (flag=false in torrent properties)', tname)
+                return False
         except QBittorrentError as exc:
-            log.warning('⚠️  Could not fetch properties for "%s": %s — falling back to URL check', tname, exc)
+            log.warning('⚠️  Could not fetch properties for "%s": %s', tname, exc)
 
-        # Method 2: Check tracker URLs for passkey/authkey patterns
-        for tracker in trackers:
-            if QBittorrentClient.has_private_tracker_url(tracker):
-                log.info('🔍 Private tracker check for "%s" → private (passkey detected in URL)', tname)
-                return True
+        # ── Method 3: DHT/PeX/LSD messages ──
+        # qBittorrent shows "Ce torrent est privé" or "This torrent is private"
+        # in the message column of internal tracker entries (** [DHT] **, etc.)
+        if QBittorrentClient.is_private_from_tracker_messages(all_trackers):
+            log.info('🔍 Private tracker check for "%s" → private (DHT/PeX message says private)', tname)
+            return True
 
-        log.info('🔍 Private tracker check for "%s" → public', tname)
+        log.info('🔍 Private tracker check for "%s" → public (no private indicators found)', tname)
         return False
 
     # ── new torrent processing ────────────────────────────────────────
@@ -168,25 +194,25 @@ class VaultService:
             log.info('   ↳ Already processed in database — skipping')
             return
 
-        # Fetch tracker list
+        # Fetch ALL tracker entries (including DHT/PeX/LSD — needed for message check)
         try:
-            trackers = self._qb.get_torrent_trackers(thash)
+            all_trackers = self._qb.get_torrent_trackers(thash)
         except QBittorrentError as exc:
             log.error('❌ Failed to fetch trackers for "%s": %s', tname, exc)
             return
 
-        # Keep only real tracker URLs (exclude DHT, PeX, LSD)
-        real_trackers = QBittorrentClient.get_real_trackers(trackers)
+        # Real trackers = only HTTP/HTTPS/UDP (not DHT/PeX/LSD)
+        real_trackers = QBittorrentClient.get_real_trackers(all_trackers)
 
         if not real_trackers:
-            log.info('🔍 Private tracker check for "%s" → public (no tracker URLs)', tname)
+            log.info('🔍 Private tracker check for "%s" → skipped (no tracker URLs)', tname)
             return
 
-        # Check if the torrent is private
-        if not self._is_torrent_private(thash, tname, real_trackers):
+        # Multi-method private detection
+        if not self._is_torrent_private(torrent, thash, tname, all_trackers):
             return
 
-        # ── PRIVATE TORRENT: save ALL trackers to DB, then strip ALL ──
+        # ── PRIVATE TORRENT: save ALL real trackers to DB, then strip ALL ──
         log.info('   ↳ %d tracker URL(s) to save and strip', len(real_trackers))
 
         urls_to_strip = []
@@ -234,7 +260,7 @@ class VaultService:
     def run(self) -> None:
         """Main entry point — connect, recover, poll forever."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v1.1.0 starting")
+        log.info("🚀 Vault-Tracker v1.2.0 starting")
         log.info("   Config: %s", self._cfg)
         log.info("=" * 60)
 

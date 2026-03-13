@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -89,7 +90,7 @@ class QBittorrentClient:
         return resp.json()
 
     def get_torrent_properties(self, torrent_hash: str) -> Dict[str, Any]:
-        """Return torrent properties (includes is_private flag)."""
+        """Return torrent properties."""
         resp = self._request(
             "GET", "torrents/properties", params={"hash": torrent_hash}
         )
@@ -118,23 +119,37 @@ class QBittorrentClient:
             data={"hash": torrent_hash, "urls": "|".join(urls)},
         )
 
-    # ── helpers ───────────────────────────────────────────────────────
+    # ── private detection ─────────────────────────────────────────────
 
     @staticmethod
-    def is_private_torrent(properties: Dict[str, Any]) -> bool:
-        """Check the is_private flag from torrent properties.
-        This is the authoritative way — set by the torrent metadata itself."""
-        return bool(properties.get("is_private", False))
+    def is_private_from_info(torrent: Dict[str, Any]) -> Optional[bool]:
+        """Check the is_private / isPrivate field from torrents/info.
+        Available since qBittorrent 5.0. Returns None if field is absent."""
+        # Try both field names (API inconsistency between versions)
+        for key in ("is_private", "isPrivate", "private"):
+            if key in torrent:
+                return bool(torrent[key])
+        return None
 
     @staticmethod
-    def has_private_tracker_url(tracker: Dict[str, Any]) -> bool:
-        """Heuristic fallback: check if a tracker URL contains auth parameters."""
-        url = tracker.get("url", "").lower()
-        private_params = [
-            "passkey=", "authkey=", "torrent_pass=", "pid=",
-            "secure=", "auth=", "key=", "user=",
-        ]
-        return any(param in url for param in private_params)
+    def is_private_from_properties(props: Dict[str, Any]) -> Optional[bool]:
+        """Check the private flag from torrents/properties.
+        Field name varies between qBittorrent versions."""
+        for key in ("isPrivate", "is_private", "private"):
+            if key in props:
+                return bool(props[key])
+        return None
+
+    @staticmethod
+    def is_private_from_tracker_messages(trackers: List[Dict[str, Any]]) -> bool:
+        """Check if any tracker's message says 'private'.
+        qBittorrent DHT/PeX/LSD entries show 'Ce torrent est privé'
+        or 'This torrent is private' for private torrents."""
+        for t in trackers:
+            msg = t.get("msg", "").lower()
+            if "private" in msg or "privé" in msg or "privee" in msg:
+                return True
+        return False
 
     @staticmethod
     def get_real_trackers(trackers: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -149,17 +164,13 @@ class QBittorrentClient:
     def mask_url(url: str) -> str:
         """Partially mask a tracker URL for safe logging.
 
-        Example:
-            https://tracker.example.com/ann?passkey=abc123def456
-            → https://tracker.example.com/ann?passkey=abc***456
-
-        URLs without query params get their path partially masked if it
-        looks like it contains a key (long alphanumeric segments).
+        Handles both:
+         - Query params: ?passkey=abc123 → ?passkey=abc***123
+         - Path keys:    /announce/abc123def456 → /announce/abc***456
         """
         parsed = urlparse(url)
 
         if parsed.query:
-            # Mask query parameter values
             pairs = parsed.query.split("&")
             masked = []
             for pair in pairs:
@@ -174,7 +185,7 @@ class QBittorrentClient:
                     masked.append(pair)
             return f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{'&'.join(masked)}"
 
-        # For URLs with keys embedded in the path (e.g. /announce/abc123def456)
+        # Mask long hex/alphanum segments in path (keys embedded in path)
         path = parsed.path
         parts = path.rsplit("/", 1)
         if len(parts) == 2 and len(parts[1]) > 8:
