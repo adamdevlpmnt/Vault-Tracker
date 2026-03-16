@@ -1,6 +1,6 @@
 services:
   vault-tracker:
-    image: ghcr.io/adamdevlpmnt/vault-tracker:latest
+    image: ghcr.io/adamdevlpmnt/vault-tracker:beta
     container_name: vault-tracker
     restart: unless-stopped
     volumes:
@@ -15,3 +15,4 @@ services:
       MAX_RETRIES: "0"
       DB_PATH: "/data/vault-tracker.db"
       LOG_LEVEL: "INFO"
+      MIN_SIZE_BYTES: "4294967296"  # 4 GB — only process torrents larger than this

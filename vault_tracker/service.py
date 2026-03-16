@@ -1,11 +1,14 @@
 """Core Vault-Tracker service — the main polling loop.
 
-Simple logic:
-    - Torrent is downloading → save its tracker URLs to DB, strip them.
-    - Torrent is seeding     → reinject saved tracker URLs from DB.
-    - On restart             → check DB for pending reinjections.
+Logic (v2.0.1-beta):
+    - New torrent detected (any state) → register it, save tracker URLs to DB.
+    - Torrent enters "downloading" state → strip tracker URLs immediately.
+    - Torrent enters seeding state       → reinject saved tracker URLs from DB.
+    - On restart                         → check DB for pending reinjections.
 
-No private/public detection. Every torrent with tracker URLs gets processed.
+Conditions:
+    - Only torrents larger than MIN_SIZE_BYTES are processed (default 4 GB).
+    - Tracker stripping waits for actual "downloading" state (not stalled/queued).
 """
 
 from __future__ import annotations
@@ -31,8 +34,14 @@ SEEDING_STATES = frozenset({
     "checkingUP",
 })
 
-# qBittorrent states: still downloading
-DOWNLOADING_STATES = frozenset({
+# States where download has actually started (data is flowing)
+ACTIVE_DOWNLOAD_STATES = frozenset({
+    "downloading",
+    "forcedDL",
+})
+
+# All download-side states (including stalled/queued — for detection only)
+ALL_DOWNLOAD_STATES = frozenset({
     "downloading",
     "stalledDL",
     "forcedDL",
@@ -43,6 +52,15 @@ DOWNLOADING_STATES = frozenset({
 })
 
 
+def _format_size(size_bytes: int) -> str:
+    """Human-readable file size."""
+    if size_bytes >= 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024**3):.2f} GB"
+    if size_bytes >= 1024 * 1024:
+        return f"{size_bytes / (1024**2):.1f} MB"
+    return f"{size_bytes / 1024:.0f} KB"
+
+
 class VaultService:
     """Main service orchestrator."""
 
@@ -50,7 +68,10 @@ class VaultService:
         self._cfg = cfg
         self._db = TrackerDB(cfg.DB_PATH)
         self._qb = QBittorrentClient(cfg)
-        self._known_hashes: Set[str] = set()  # torrents we've already processed
+        self._known_hashes: Set[str] = set()       # all torrents we've seen
+        self._saved_hashes: Set[str] = set()        # torrents whose trackers are saved in DB
+        self._stripped_hashes: Set[str] = set()     # torrents whose trackers have been stripped
+        self._last_torrent_count: int = -1          # for log dedup
         self._running = True
 
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -111,39 +132,54 @@ class VaultService:
         torrent_map = {t["hash"]: t for t in torrents}
         for thash, items in by_hash.items():
             self._known_hashes.add(thash)
+            self._saved_hashes.add(thash)
+            self._stripped_hashes.add(thash)
             t = torrent_map.get(thash)
             if t and t.get("state") in SEEDING_STATES:
                 self._reinject_trackers(thash, t.get("name", "?"))
 
-    # ── strip trackers (on download) ──────────────────────────────────
+    # ── save trackers to DB (on detection) ────────────────────────────
 
-    def _strip_trackers(self, torrent: Dict[str, Any]) -> None:
-        """Save and strip all tracker URLs from a downloading torrent."""
+    def _save_trackers(self, torrent: Dict[str, Any]) -> bool:
+        """Save all tracker URLs for a torrent to the database.
+        Returns True if trackers were saved, False otherwise."""
         thash = torrent["hash"]
         tname = torrent.get("name", "unknown")
+        size = torrent.get("size", 0) or torrent.get("total_size", 0)
 
-        log.info('🆕 New downloading torrent detected: "%s" [hash: %s]', tname, thash[:8])
+        # Size filter
+        if size < self._cfg.MIN_SIZE_BYTES:
+            log.info(
+                '🔍 Torrent "%s" [%s] — skipped (size %s < %s)',
+                tname, thash[:8], _format_size(size), self._cfg.min_size_display,
+            )
+            return False
 
-        # Already processed?
+        log.info(
+            '🆕 New torrent detected: "%s" [hash: %s] [size: %s]',
+            tname, thash[:8], _format_size(size),
+        )
+
+        # Already in DB?
         if self._db.has_records(thash):
             log.info('   ↳ Already processed in database — skipping')
-            return
+            self._saved_hashes.add(thash)
+            return True
 
         # Fetch trackers
         try:
             all_trackers = self._qb.get_torrent_trackers(thash)
         except QBittorrentError as exc:
             log.error('❌ Failed to fetch trackers for "%s": %s', tname, exc)
-            return
+            return False
 
         real_trackers = QBittorrentClient.get_real_trackers(all_trackers)
 
         if not real_trackers:
-            log.info('   ↳ No tracker URLs found — nothing to strip')
-            return
+            log.info('   ↳ No tracker URLs found — nothing to do')
+            return False
 
-        # Save each tracker URL to database
-        urls_to_strip = []
+        # Save each tracker URL
         for tracker in real_trackers:
             url = tracker["url"]
             tier = tracker.get("tier", 0)
@@ -154,11 +190,26 @@ class VaultService:
                 log.info("💾 Tracker URL saved: %s → ✅ OK", masked)
             else:
                 log.info("💾 Tracker URL already in database: %s → ✅ OK (duplicate)", masked)
-            urls_to_strip.append(url)
 
-        # Strip all at once
+        log.info('   ↳ %d tracker URL(s) saved — waiting for active download to strip', len(real_trackers))
+        self._saved_hashes.add(thash)
+        return True
+
+    # ── strip trackers (when download starts) ─────────────────────────
+
+    def _strip_trackers(self, torrent: Dict[str, Any]) -> None:
+        """Strip all saved tracker URLs from a torrent that has started downloading."""
+        thash = torrent["hash"]
+        tname = torrent.get("name", "unknown")
+
+        pending = self._db.get_pending(thash)
+        if not pending:
+            return
+
+        urls_to_strip = [url for url, _tier in pending]
         try:
             self._qb.remove_trackers(thash, urls_to_strip)
+            self._stripped_hashes.add(thash)
             log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK (%d removed)', tname, len(urls_to_strip))
         except QBittorrentError as exc:
             log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
@@ -187,7 +238,7 @@ class VaultService:
     def run(self) -> None:
         """Main entry point."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v2.0.0 starting")
+        log.info("🚀 Vault-Tracker v2.0.1-beta starting")
         log.info("   Config: %s", self._cfg)
         log.info("=" * 60)
 
@@ -206,28 +257,35 @@ class VaultService:
                 self._connect()
                 continue
 
-            log.info("🔄 Polling cycle — %d torrent(s) detected", len(torrents))
+            count = len(torrents)
+
+            # Only log torrent count when it changes
+            if count != self._last_torrent_count:
+                log.info("🔄 Polling cycle — %d torrent(s) detected", count)
+                self._last_torrent_count = count
 
             for torrent in torrents:
                 thash = torrent["hash"]
                 tname = torrent.get("name", "unknown")
                 state = torrent.get("state", "unknown")
 
-                # ── Downloading: strip trackers ──
-                if state in DOWNLOADING_STATES and thash not in self._known_hashes:
+                # ── Step 1: New torrent → save trackers to DB ──
+                if thash not in self._known_hashes:
                     self._known_hashes.add(thash)
+                    if state in ALL_DOWNLOAD_STATES:
+                        self._save_trackers(torrent)
+
+                # ── Step 2: Active download → strip trackers ──
+                if (
+                    state in ACTIVE_DOWNLOAD_STATES
+                    and thash in self._saved_hashes
+                    and thash not in self._stripped_hashes
+                ):
                     self._strip_trackers(torrent)
 
-                # ── Seeding: reinject trackers ──
-                elif state in SEEDING_STATES:
-                    if thash not in self._known_hashes:
-                        self._known_hashes.add(thash)  # already seeding, just mark known
-                    if self._db.get_pending(thash):
-                        self._reinject_trackers(thash, tname)
-
-                # ── Other states: just mark as known ──
-                elif thash not in self._known_hashes:
-                    self._known_hashes.add(thash)
+                # ── Step 3: Seeding → reinject trackers ──
+                if state in SEEDING_STATES and self._db.get_pending(thash):
+                    self._reinject_trackers(thash, tname)
 
             time.sleep(self._cfg.POLL_INTERVAL)
 

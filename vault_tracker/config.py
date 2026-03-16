@@ -27,15 +27,27 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
+    # Filter: minimum torrent size in bytes (default 4 GB)
+    MIN_SIZE_BYTES: int = int(os.getenv("MIN_SIZE_BYTES", str(4 * 1024 * 1024 * 1024)))
+
     @property
     def qb_url(self) -> str:
         """Full base URL for the qBittorrent WebUI API."""
         host = self.QB_HOST.rstrip("/")
         return f"{host}:{self.QB_PORT}"
 
+    @property
+    def min_size_display(self) -> str:
+        """Human-readable minimum size."""
+        gb = self.MIN_SIZE_BYTES / (1024 * 1024 * 1024)
+        if gb >= 1:
+            return f"{gb:.1f} GB"
+        mb = self.MIN_SIZE_BYTES / (1024 * 1024)
+        return f"{mb:.0f} MB"
+
     def __repr__(self) -> str:
         return (
             f"Config(qb_url={self.qb_url!r}, poll={self.POLL_INTERVAL}s, "
             f"retry={self.RETRY_DELAY}s, db={self.DB_PATH!r}, "
-            f"log_level={self.LOG_LEVEL!r})"
+            f"min_size={self.min_size_display}, log_level={self.LOG_LEVEL!r})"
         )
