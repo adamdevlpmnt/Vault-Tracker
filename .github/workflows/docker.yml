@@ -1,0 +1,29 @@
+name: Build & Push Docker (DEV)
+
+on:
+  push:
+    branches:
+      - beta   # ta branche actuelle
+      - dev    # optionnel si tu l’utilises
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔑 Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏗️ Build & Push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/adamdevlpmnt/vault-tracker:dev
