@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -110,6 +110,106 @@ class QBittorrentClient:
             "torrents/removeTrackers",
             data={"hash": torrent_hash, "urls": "|".join(urls)},
         )
+
+    def export_torrent(self, torrent_hash: str) -> bytes:
+        """Export the raw .torrent file for a given torrent hash.
+
+        Returns raw bytes of the .torrent file.
+        Raises QBittorrentError if the export fails or returns empty content.
+        """
+        resp = self._request(
+            "GET",
+            "torrents/export",
+            params={"hash": torrent_hash},
+        )
+        if not resp.content:
+            raise QBittorrentError(f"Empty .torrent export for hash {torrent_hash}")
+        return resp.content
+
+    def delete_torrent(self, torrent_hash: str, delete_files: bool = False) -> None:
+        """Remove a torrent from qBittorrent.
+
+        Args:
+            torrent_hash: The info-hash of the torrent to remove.
+            delete_files: If True, also delete downloaded data from disk.
+                          Default False — keep files for cross-seed.
+        """
+        self._request(
+            "POST",
+            "torrents/delete",
+            data={
+                "hashes": torrent_hash,
+                "deleteFiles": "true" if delete_files else "false",
+            },
+        )
+
+    def add_torrent_file(
+        self,
+        torrent_data: bytes,
+        save_path: str = "",
+        skip_checking: bool = False,
+        is_paused: bool = False,
+        category: str = "",
+        tags: str = "",
+    ) -> None:
+        """Add a torrent from raw .torrent file bytes.
+
+        Args:
+            torrent_data:  Raw bytes of the .torrent file.
+            save_path:     Directory where data already lives (for cross-seed).
+            skip_checking: Skip hash verification — set True for cross-seed re-add.
+            is_paused:     Add in paused state (useful for review before seeding).
+            category:      Optional qBittorrent category.
+            tags:          Optional comma-separated tags.
+        """
+        data: Dict[str, Any] = {
+            "savepath": save_path,
+            "skip_checking": "true" if skip_checking else "false",
+            "paused": "true" if is_paused else "false",
+        }
+        if category:
+            data["category"] = category
+        if tags:
+            data["tags"] = tags
+
+        self._request(
+            "POST",
+            "torrents/add",
+            data=data,
+            files={"torrents": ("vault-tracker.torrent", torrent_data, "application/x-bittorrent")},
+        )
+
+    def add_torrent_magnet(
+        self,
+        magnet_uri: str,
+        save_path: str = "",
+        skip_checking: bool = False,
+        is_paused: bool = False,
+        category: str = "",
+        tags: str = "",
+    ) -> None:
+        """Add a torrent from a magnet URI (fallback when .torrent export unavailable).
+
+        Args:
+            magnet_uri:    The magnet link.
+            save_path:     Directory where data already lives.
+            skip_checking: Skip hash verification.
+            is_paused:     Add in paused state.
+            category:      Optional qBittorrent category.
+            tags:          Optional comma-separated tags.
+        """
+        data: Dict[str, Any] = {
+            "urls": magnet_uri,
+            "savepath": save_path,
+            "skip_checking": "true" if skip_checking else "false",
+            "paused": "true" if is_paused else "false",
+        }
+        if category:
+            data["category"] = category
+        if tags:
+            data["tags"] = tags
+
+        self._request("POST", "torrents/add", data=data)
 
     # ── helpers ───────────────────────────────────────────────────────
 

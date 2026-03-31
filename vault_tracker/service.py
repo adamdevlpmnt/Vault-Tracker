@@ -1,10 +1,13 @@
 """Core Vault-Tracker service — the main polling loop.
 
-Logic (v2.0.1-beta):
+Logic (v3.0-beta):
     - New torrent detected (any state) → register it, save tracker URLs to DB.
     - Torrent enters "downloading" state → strip tracker URLs immediately.
-    - Torrent enters seeding state       → reinject saved tracker URLs from DB.
-    - On restart                         → check DB for pending reinjections.
+    - Torrent enters seeding state:
+        * If state is "moving" → wait, do NOT reinject yet.
+        * Once move is complete → delete the torrent (keep files), re-add it
+          without data (cross-seed simulation), then reinject saved tracker URLs.
+    - On restart → check DB for pending reinjections.
 
 Conditions:
     - Only torrents larger than MIN_SIZE_BYTES are processed (default 4 GB).
@@ -33,6 +36,9 @@ SEEDING_STATES = frozenset({
     "queuedUP",
     "checkingUP",
 })
+
+# State indicating the torrent's files are being moved to final location
+MOVING_STATE = "moving"
 
 # States where download has actually started (data is flowing)
 ACTIVE_DOWNLOAD_STATES = frozenset({
@@ -68,10 +74,12 @@ class VaultService:
         self._cfg = cfg
         self._db = TrackerDB(cfg.DB_PATH)
         self._qb = QBittorrentClient(cfg)
-        self._known_hashes: Set[str] = set()       # all torrents we've seen
-        self._saved_hashes: Set[str] = set()        # torrents whose trackers are saved in DB
-        self._stripped_hashes: Set[str] = set()     # torrents whose trackers have been stripped
-        self._last_torrent_count: int = -1          # for log dedup
+        self._known_hashes: Set[str] = set()           # all torrents we've seen
+        self._saved_hashes: Set[str] = set()            # torrents whose trackers are saved in DB
+        self._stripped_hashes: Set[str] = set()         # torrents whose trackers have been stripped
+        self._moving_hashes: Set[str] = set()           # torrents currently being moved (waiting)
+        self._reinjected_hashes: Set[str] = set()       # torrents already fully reinjected
+        self._last_torrent_count: int = -1              # for log dedup
         self._running = True
 
         signal.signal(signal.SIGTERM, self._handle_signal)
@@ -135,8 +143,16 @@ class VaultService:
             self._saved_hashes.add(thash)
             self._stripped_hashes.add(thash)
             t = torrent_map.get(thash)
-            if t and t.get("state") in SEEDING_STATES:
-                self._reinject_trackers(thash, t.get("name", "?"))
+            if t:
+                state = t.get("state", "")
+                if state == MOVING_STATE:
+                    log.info(
+                        "🔁 [%s] still moving on restart — will wait before reinjecting",
+                        thash[:8],
+                    )
+                    self._moving_hashes.add(thash)
+                elif state in SEEDING_STATES:
+                    self._handle_seeding(thash, t.get("name", "?"), t)
 
     # ── save trackers to DB (on detection) ────────────────────────────
 
@@ -214,16 +230,77 @@ class VaultService:
         except QBittorrentError as exc:
             log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
 
-    # ── reinject trackers (on seeding) ────────────────────────────────
+    # ── cross-seed re-add + reinject (on seeding, after move) ─────────
 
-    def _reinject_trackers(self, thash: str, tname: str) -> None:
-        """Reinject all saved trackers for a torrent that has entered seeding state."""
+    def _handle_seeding(self, thash: str, tname: str, torrent: Dict[str, Any]) -> None:
+        """
+        Called when a torrent enters a stable seeding state (not moving).
+
+        Strategy (v3.0-beta cross-seed simulation):
+          1. Fetch the .torrent magnet/info we need to re-add it.
+          2. Delete the torrent entry from qBittorrent (keep the files on disk).
+          3. Re-add the torrent pointing to the same save path (skip hash check
+             so qBittorrent treats it as a finished cross-seed immediately).
+          4. Reinject the saved tracker URLs.
+        """
         pending = self._db.get_pending(thash)
         if not pending:
             return
 
-        log.info('✅ Torrent completed, seeding state detected: "%s"', tname)
+        if thash in self._reinjected_hashes:
+            return
 
+        log.info('✅ Torrent completed & moved, entering cross-seed simulation: "%s"', tname)
+
+        save_path = torrent.get("save_path", "")
+        content_path = torrent.get("content_path", "")
+        magnet_uri = torrent.get("magnet_uri") or ""
+
+        # ── Step 1: fetch the raw .torrent file from qBittorrent ──
+        torrent_file_data: bytes | None = None
+        try:
+            torrent_file_data = self._qb.export_torrent(thash)
+            log.info('   ↳ .torrent file exported → ✅ OK')
+        except QBittorrentError as exc:
+            log.warning('   ↳ Could not export .torrent file: %s — will fall back to magnet', exc)
+
+        # ── Step 2: delete torrent entry (keep files) ──
+        try:
+            self._qb.delete_torrent(thash, delete_files=False)
+            log.info('   ↳ Torrent entry deleted (files kept) → ✅ OK')
+        except QBittorrentError as exc:
+            log.error('   ↳ Failed to delete torrent entry: %s → ❌ ERROR — aborting cross-seed', exc)
+            return
+
+        # Give qBittorrent a moment to remove the entry cleanly
+        time.sleep(2)
+
+        # ── Step 3: re-add the torrent (cross-seed style, skip checking) ──
+        try:
+            if torrent_file_data:
+                self._qb.add_torrent_file(
+                    torrent_data=torrent_file_data,
+                    save_path=save_path,
+                    skip_checking=True,
+                )
+            elif magnet_uri:
+                self._qb.add_torrent_magnet(
+                    magnet_uri=magnet_uri,
+                    save_path=save_path,
+                    skip_checking=True,
+                )
+            else:
+                log.error('   ↳ No .torrent data or magnet URI available → ❌ Cannot re-add')
+                return
+            log.info('   ↳ Torrent re-added (cross-seed, skip_checking=True) → ✅ OK')
+        except QBittorrentError as exc:
+            log.error('   ↳ Failed to re-add torrent: %s → ❌ ERROR', exc)
+            return
+
+        # Give qBittorrent a moment to register the new entry and assign the same hash
+        time.sleep(3)
+
+        # ── Step 4: reinject saved tracker URLs ──
         for tracker_url, tier in pending:
             masked = QBittorrentClient.mask_url(tracker_url)
             try:
@@ -233,12 +310,15 @@ class VaultService:
             except QBittorrentError as exc:
                 log.error("💉 Failed to reinject tracker %s → ❌ ERROR (%s)", masked, exc)
 
+        self._reinjected_hashes.add(thash)
+        log.info('🎉 Cross-seed simulation complete for "%s"', tname)
+
     # ── main loop ─────────────────────────────────────────────────────
 
     def run(self) -> None:
         """Main entry point."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v2.0.1-beta starting")
+        log.info("🚀 Vault-Tracker v3.0-beta starting")
         log.info("   Config: %s", self._cfg)
         log.info("=" * 60)
 
@@ -283,9 +363,31 @@ class VaultService:
                 ):
                     self._strip_trackers(torrent)
 
-                # ── Step 3: Seeding → reinject trackers ──
-                if state in SEEDING_STATES and self._db.get_pending(thash):
-                    self._reinject_trackers(thash, tname)
+                # ── Step 3: Moving state detected → log and wait ──
+                if state == MOVING_STATE and thash in self._stripped_hashes:
+                    if thash not in self._moving_hashes:
+                        log.info(
+                            '📦 Torrent "%s" [%s] is moving files — waiting before cross-seed…',
+                            tname, thash[:8],
+                        )
+                        self._moving_hashes.add(thash)
+
+                # ── Step 4: Stable seeding state → cross-seed + reinject ──
+                if (
+                    state in SEEDING_STATES
+                    and thash in self._stripped_hashes
+                    and thash not in self._reinjected_hashes
+                    and self._db.get_pending(thash)
+                ):
+                    # Was previously moving → now stable, proceed
+                    if thash in self._moving_hashes:
+                        log.info(
+                            '📦 Torrent "%s" [%s] finished moving → proceeding with cross-seed',
+                            tname, thash[:8],
+                        )
+                        self._moving_hashes.discard(thash)
+
+                    self._handle_seeding(thash, tname, torrent)
 
             time.sleep(self._cfg.POLL_INTERVAL)
 
