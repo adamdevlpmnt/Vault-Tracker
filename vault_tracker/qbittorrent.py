@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -81,12 +81,32 @@ class QBittorrentClient:
                 raise
         raise QBittorrentError("Max retries exceeded")  # pragma: no cover
 
+    # ── sync ──────────────────────────────────────────────────────────
+
+    def sync_maindata(self, rid: int = 0) -> Dict[str, Any]:
+        """Fetch delta sync data from qBittorrent.
+
+        Uses /api/v2/sync/maindata with a request ID (rid) to receive only
+        changes since the last call. Pass rid=0 for a full snapshot.
+        Returns the parsed JSON response including 'rid', 'torrents', etc.
+        """
+        resp = self._request("GET", "sync/maindata", params={"rid": rid})
+        return resp.json()
+
     # ── torrent operations ────────────────────────────────────────────
 
     def get_torrents(self) -> List[Dict[str, Any]]:
         """Return the full torrent list."""
         resp = self._request("GET", "torrents/info")
         return resp.json()
+
+    def get_torrent_info(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """Return info for a single torrent by hash, or None if not found."""
+        resp = self._request(
+            "GET", "torrents/info", params={"hashes": torrent_hash}
+        )
+        result = resp.json()
+        return result[0] if result else None
 
     def get_torrent_trackers(self, torrent_hash: str) -> List[Dict[str, Any]]:
         """Return tracker list for a torrent."""
@@ -95,14 +115,6 @@ class QBittorrentClient:
         )
         return resp.json()
 
-    def add_trackers(self, torrent_hash: str, urls: List[str]) -> None:
-        """Add one or more tracker URLs to a torrent."""
-        self._request(
-            "POST",
-            "torrents/addTrackers",
-            data={"hash": torrent_hash, "urls": "\n".join(urls)},
-        )
-
     def remove_trackers(self, torrent_hash: str, urls: List[str]) -> None:
         """Remove tracker URLs from a torrent."""
         self._request(
@@ -110,6 +122,54 @@ class QBittorrentClient:
             "torrents/removeTrackers",
             data={"hash": torrent_hash, "urls": "|".join(urls)},
         )
+
+    def export_torrent(self, torrent_hash: str) -> bytes:
+        """Export the .torrent file for a torrent.
+
+        Returns the raw binary content of the .torrent file.
+        """
+        resp = self._request(
+            "GET", "torrents/export", params={"hash": torrent_hash}
+        )
+        return resp.content
+
+    def delete_torrent(self, torrent_hash: str, delete_files: bool = False) -> None:
+        """Delete a torrent from qBittorrent.
+
+        By default keeps downloaded files on disk (delete_files=False).
+        """
+        self._request(
+            "POST",
+            "torrents/delete",
+            data={
+                "hashes": torrent_hash,
+                "deleteFiles": str(delete_files).lower(),
+            },
+        )
+
+    def add_torrent_file(
+        self,
+        torrent_bytes: bytes,
+        save_path: str,
+        category: str = "",
+        tags: str = "",
+        paused: bool = False,
+    ) -> None:
+        """Add a .torrent file to qBittorrent.
+
+        Re-adds the torrent with its original save path, category, and tags.
+        qBittorrent will check existing files and resume seeding.
+        """
+        files = {"torrents": ("torrent.torrent", torrent_bytes, "application/x-bittorrent")}
+        data: Dict[str, str] = {
+            "savepath": save_path,
+            "paused": str(paused).lower(),
+        }
+        if category:
+            data["category"] = category
+        if tags:
+            data["tags"] = tags
+        self._request("POST", "torrents/add", files=files, data=data)
 
     # ── helpers ───────────────────────────────────────────────────────
 
