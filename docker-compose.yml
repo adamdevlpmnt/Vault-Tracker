@@ -1,18 +1,22 @@
+version: "3.8"
+
 services:
   vault-tracker:
-    image: ghcr.io/adamdevlpmnt/vault-tracker:beta
-    container_name: vault-tracker
+    image: ghcr.io/adamdevlpmnt/vault-tracker:dev
+    container_name: vault-tracker-dev
     restart: unless-stopped
-    volumes:
-      - /mnt/TANK/Config/Vault-Tracker:/data
     environment:
-      QB_HOST: "http://192.168.1.100"
-      QB_PORT: "8080"
-      QB_USERNAME: "admin"
-      QB_PASSWORD: "adminadmin"
-      POLL_INTERVAL: "10"
-      RETRY_DELAY: "30"
-      MAX_RETRIES: "0"
-      DB_PATH: "/data/vault-tracker.db"
-      LOG_LEVEL: "INFO"
-      MIN_SIZE_BYTES: "4294967296"  # 4 GB — only process torrents larger than this
+      - QB_HOST=http://qbittorrent        # URL de ton qBittorrent
+      - QB_PORT=8080                       # Port WebUI
+      - QB_USERNAME=admin                  # Utilisateur WebUI
+      - QB_PASSWORD=adminadmin             # Mot de passe WebUI
+      - MIN_SIZE_BYTES=4294967296          # 4 GB — mettre 0 pour désactiver le filtre
+      - LOG_LEVEL=INFO                     # DEBUG, INFO, WARNING, ERROR
+      - DB_PATH=/data/vault-tracker.db     # Chemin de la base SQLite
+      - RETRY_DELAY=30                     # Délai de reconnexion (secondes)
+      - MAX_RETRIES=0                      # 0 = tentatives infinies
+    volumes:
+      - vault-tracker-data:/data
+
+volumes:
+  vault-tracker-data:

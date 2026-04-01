@@ -81,6 +81,18 @@ class QBittorrentClient:
                 raise
         raise QBittorrentError("Max retries exceeded")  # pragma: no cover
 
+    # ── sync ──────────────────────────────────────────────────────────
+
+    def sync_maindata(self, rid: int = 0) -> Dict[str, Any]:
+        """Fetch delta sync data from qBittorrent.
+
+        Uses /api/v2/sync/maindata with a request ID (rid) to receive only
+        changes since the last call. Pass rid=0 for a full snapshot.
+        Returns the parsed JSON response including 'rid', 'torrents', etc.
+        """
+        resp = self._request("GET", "sync/maindata", params={"rid": rid})
+        return resp.json()
+
     # ── torrent operations ────────────────────────────────────────────
 
     def get_torrents(self) -> List[Dict[str, Any]]:
@@ -88,20 +100,20 @@ class QBittorrentClient:
         resp = self._request("GET", "torrents/info")
         return resp.json()
 
+    def get_torrent_info(self, torrent_hash: str) -> Optional[Dict[str, Any]]:
+        """Return info for a single torrent by hash, or None if not found."""
+        resp = self._request(
+            "GET", "torrents/info", params={"hashes": torrent_hash}
+        )
+        result = resp.json()
+        return result[0] if result else None
+
     def get_torrent_trackers(self, torrent_hash: str) -> List[Dict[str, Any]]:
         """Return tracker list for a torrent."""
         resp = self._request(
             "GET", "torrents/trackers", params={"hash": torrent_hash}
         )
         return resp.json()
-
-    def add_trackers(self, torrent_hash: str, urls: List[str]) -> None:
-        """Add one or more tracker URLs to a torrent."""
-        self._request(
-            "POST",
-            "torrents/addTrackers",
-            data={"hash": torrent_hash, "urls": "\n".join(urls)},
-        )
 
     def remove_trackers(self, torrent_hash: str, urls: List[str]) -> None:
         """Remove tracker URLs from a torrent."""
@@ -112,104 +124,52 @@ class QBittorrentClient:
         )
 
     def export_torrent(self, torrent_hash: str) -> bytes:
-        """Export the raw .torrent file for a given torrent hash.
+        """Export the .torrent file for a torrent.
 
-        Returns raw bytes of the .torrent file.
-        Raises QBittorrentError if the export fails or returns empty content.
+        Returns the raw binary content of the .torrent file.
         """
         resp = self._request(
-            "GET",
-            "torrents/export",
-            params={"hash": torrent_hash},
+            "GET", "torrents/export", params={"hash": torrent_hash}
         )
-        if not resp.content:
-            raise QBittorrentError(f"Empty .torrent export for hash {torrent_hash}")
         return resp.content
 
     def delete_torrent(self, torrent_hash: str, delete_files: bool = False) -> None:
-        """Remove a torrent from qBittorrent.
+        """Delete a torrent from qBittorrent.
 
-        Args:
-            torrent_hash: The info-hash of the torrent to remove.
-            delete_files: If True, also delete downloaded data from disk.
-                          Default False — keep files for cross-seed.
+        By default keeps downloaded files on disk (delete_files=False).
         """
         self._request(
             "POST",
             "torrents/delete",
             data={
                 "hashes": torrent_hash,
-                "deleteFiles": "true" if delete_files else "false",
+                "deleteFiles": str(delete_files).lower(),
             },
         )
 
     def add_torrent_file(
         self,
-        torrent_data: bytes,
-        save_path: str = "",
-        skip_checking: bool = False,
-        is_paused: bool = False,
+        torrent_bytes: bytes,
+        save_path: str,
         category: str = "",
         tags: str = "",
+        paused: bool = False,
     ) -> None:
-        """Add a torrent from raw .torrent file bytes.
+        """Add a .torrent file to qBittorrent.
 
-        Args:
-            torrent_data:  Raw bytes of the .torrent file.
-            save_path:     Directory where data already lives (for cross-seed).
-            skip_checking: Skip hash verification — set True for cross-seed re-add.
-            is_paused:     Add in paused state (useful for review before seeding).
-            category:      Optional qBittorrent category.
-            tags:          Optional comma-separated tags.
+        Re-adds the torrent with its original save path, category, and tags.
+        qBittorrent will check existing files and resume seeding.
         """
-        data: Dict[str, Any] = {
+        files = {"torrents": ("torrent.torrent", torrent_bytes, "application/x-bittorrent")}
+        data: Dict[str, str] = {
             "savepath": save_path,
-            "skip_checking": "true" if skip_checking else "false",
-            "paused": "true" if is_paused else "false",
+            "paused": str(paused).lower(),
         }
         if category:
             data["category"] = category
         if tags:
             data["tags"] = tags
-
-        self._request(
-            "POST",
-            "torrents/add",
-            data=data,
-            files={"torrents": ("vault-tracker.torrent", torrent_data, "application/x-bittorrent")},
-        )
-
-    def add_torrent_magnet(
-        self,
-        magnet_uri: str,
-        save_path: str = "",
-        skip_checking: bool = False,
-        is_paused: bool = False,
-        category: str = "",
-        tags: str = "",
-    ) -> None:
-        """Add a torrent from a magnet URI (fallback when .torrent export unavailable).
-
-        Args:
-            magnet_uri:    The magnet link.
-            save_path:     Directory where data already lives.
-            skip_checking: Skip hash verification.
-            is_paused:     Add in paused state.
-            category:      Optional qBittorrent category.
-            tags:          Optional comma-separated tags.
-        """
-        data: Dict[str, Any] = {
-            "urls": magnet_uri,
-            "savepath": save_path,
-            "skip_checking": "true" if skip_checking else "false",
-            "paused": "true" if is_paused else "false",
-        }
-        if category:
-            data["category"] = category
-        if tags:
-            data["tags"] = tags
-
-        self._request("POST", "torrents/add", data=data)
+        self._request("POST", "torrents/add", files=files, data=data)
 
     # ── helpers ───────────────────────────────────────────────────────
 

@@ -14,10 +14,7 @@ class Config:
     QB_USERNAME: str = os.getenv("QB_USERNAME", "admin")
     QB_PASSWORD: str = os.getenv("QB_PASSWORD", "adminadmin")
 
-    # Polling
-    POLL_INTERVAL: int = int(os.getenv("POLL_INTERVAL", "10"))  # seconds
-
-    # Retry
+    # Retry (initial connection only)
     RETRY_DELAY: int = int(os.getenv("RETRY_DELAY", "30"))  # seconds
     MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "0"))  # 0 = infinite
 
@@ -27,8 +24,8 @@ class Config:
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 
-    # Filter: minimum torrent size in bytes (default 4 GB)
-    MIN_SIZE_BYTES: int = int(os.getenv("MIN_SIZE_BYTES", str(4 * 1024 * 1024 * 1024)))
+    # Filter: minimum torrent size in bytes (0 = no filter)
+    MIN_SIZE_BYTES: int = int(os.getenv("MIN_SIZE_BYTES", "0"))
 
     @property
     def qb_url(self) -> str:
@@ -38,7 +35,9 @@ class Config:
 
     @property
     def min_size_display(self) -> str:
-        """Human-readable minimum size."""
+        """Human-readable minimum size, or 'no filter' when disabled."""
+        if self.MIN_SIZE_BYTES == 0:
+            return "no filter"
         gb = self.MIN_SIZE_BYTES / (1024 * 1024 * 1024)
         if gb >= 1:
             return f"{gb:.1f} GB"
@@ -47,7 +46,7 @@ class Config:
 
     def __repr__(self) -> str:
         return (
-            f"Config(qb_url={self.qb_url!r}, poll={self.POLL_INTERVAL}s, "
+            f"Config(qb_url={self.qb_url!r}, "
             f"retry={self.RETRY_DELAY}s, db={self.DB_PATH!r}, "
             f"min_size={self.min_size_display}, log_level={self.LOG_LEVEL!r})"
         )
