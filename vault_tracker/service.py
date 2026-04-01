@@ -1,7 +1,8 @@
 """Core Vault-Tracker service — real-time sync loop.
 
-Logic (v3.0.0-dev):
+Logic (v3.0.1-dev):
     - Uses /api/v2/sync/maindata (rid-based delta sync) for real-time detection.
+    - On first sync (rid=0): processes ALL existing torrents (initial scan).
     - New torrent detected → save tracker URLs + metadata + .torrent file to DB.
     - Torrent enters "downloading" or "forcedDL" → strip tracker URLs instantly.
     - Torrent enters seeding state → delete torrent (keep files) → re-add .torrent
@@ -74,6 +75,7 @@ class VaultService:
         self._saved_hashes: Set[str] = set()        # torrents whose trackers are saved in DB
         self._stripped_hashes: Set[str] = set()     # torrents whose trackers have been stripped
         self._completed_hashes: Set[str] = set()    # torrents that have been deleted and re-added
+        self._torrent_states: Dict[str, str] = {}   # last known state per hash
         self._rid: int = 0                          # sync/maindata request ID
         self._running = True
 
@@ -157,6 +159,53 @@ class VaultService:
                     except QBittorrentError as exc:
                         log.error('✂️  Recovery: failed to strip trackers from "%s": %s', t.get("name", "?"), exc)
 
+    # ── initial scan (first sync, rid=0) ──────────────────────────────
+
+    def _initial_scan(self, torrents: Dict[str, Any]) -> None:
+        """Process all torrents from the first sync/maindata snapshot (rid=0).
+
+        This ensures torrents that were already present before Vault-Tracker
+        started are detected and processed correctly.
+        """
+        if not torrents:
+            log.info("🔍 Initial scan — no torrents in qBittorrent")
+            return
+
+        log.info("🔍 Initial scan — %d torrent(s) in qBittorrent", len(torrents))
+
+        for thash, tinfo in torrents.items():
+            state = tinfo.get("state", "unknown")
+            self._known_hashes.add(thash)
+            self._torrent_states[thash] = state
+
+            # Skip torrents already fully handled in DB
+            if self._db.has_records(thash):
+                pending = self._db.get_pending(thash)
+                if pending:
+                    self._saved_hashes.add(thash)
+                    # Check if trackers need stripping or completion
+                    if state in ACTIVE_DOWNLOAD_STATES:
+                        torrent_info = self._fetch_torrent_info(thash)
+                        if torrent_info:
+                            self._strip_trackers(torrent_info)
+                    elif state in SEEDING_STATES:
+                        self._stripped_hashes.add(thash)
+                        self._complete_torrent(thash, tinfo.get("name", "?"))
+                else:
+                    self._saved_hashes.add(thash)
+                    self._stripped_hashes.add(thash)
+                    self._completed_hashes.add(thash)
+                continue
+
+            # New torrent in download states → save + possibly strip
+            if state in ALL_DOWNLOAD_STATES:
+                torrent_info = self._fetch_torrent_info(thash)
+                if torrent_info:
+                    saved = self._save_trackers(torrent_info)
+                    # If actively downloading, strip immediately
+                    if saved and state in ACTIVE_DOWNLOAD_STATES:
+                        self._strip_trackers(torrent_info)
+
     # ── save trackers + metadata to DB ────────────────────────────────
 
     def _save_trackers(self, torrent: Dict[str, Any]) -> bool:
@@ -175,8 +224,8 @@ class VaultService:
             return False
 
         log.info(
-            '🆕 New torrent detected: "%s" [hash: %s] [size: %s]',
-            tname, thash[:8], _format_size(size),
+            '🆕 New torrent detected: "%s" [hash: %s] [size: %s] [state: %s]',
+            tname, thash[:8], _format_size(size), torrent.get("state", "unknown"),
         )
 
         # Already in DB?
@@ -316,7 +365,7 @@ class VaultService:
     def run(self) -> None:
         """Main entry point using real-time sync/maindata."""
         log.info("=" * 60)
-        log.info("🚀 Vault-Tracker v3.0.0-dev starting")
+        log.info("🚀 Vault-Tracker v3.0.1-dev starting")
         log.info("   qb_url:    %s", self._cfg.qb_url)
         log.info("   min_size:  %s", self._cfg.min_size_display)
         log.info("   log_level: %s", self._cfg.LOG_LEVEL)
@@ -325,6 +374,17 @@ class VaultService:
 
         self._connect()
         self._recover_pending()
+
+        # First sync: full snapshot — process all existing torrents
+        log.info("⏳ Performing initial sync with qBittorrent…")
+        try:
+            data = self._qb.sync_maindata(rid=0)
+            self._rid = data.get("rid", 0)
+            initial_torrents = data.get("torrents", {})
+            self._initial_scan(initial_torrents)
+            log.info("✅ Initial sync complete — entering real-time monitoring")
+        except QBittorrentError:
+            log.warning("⚠️  Initial sync failed — will retry in main loop")
 
         while self._running:
             try:
@@ -349,38 +409,49 @@ class VaultService:
                 self._saved_hashes.discard(rhash)
                 self._stripped_hashes.discard(rhash)
                 self._completed_hashes.discard(rhash)
+                self._torrent_states.pop(rhash, None)
 
-            # Process torrent updates
+            # Process torrent updates from delta
             for thash, tinfo in torrents_delta.items():
-                state = tinfo.get("state")
+                # Update state tracking — delta may or may not include state
+                new_state = tinfo.get("state")
+                if new_state:
+                    self._torrent_states[thash] = new_state
+                current_state = self._torrent_states.get(thash)
 
-                # New torrent detection
+                # ── New torrent detected ──
                 if thash not in self._known_hashes:
                     self._known_hashes.add(thash)
-                    # Need full torrent info for metadata — fetch it
-                    if state and state in ALL_DOWNLOAD_STATES:
+                    if current_state and current_state in ALL_DOWNLOAD_STATES:
+                        log.info("🔔 New torrent appeared in sync delta [hash: %s] [state: %s]", thash[:8], current_state)
                         torrent_info = self._fetch_torrent_info(thash)
                         if torrent_info:
-                            self._save_trackers(torrent_info)
+                            saved = self._save_trackers(torrent_info)
+                            # If already actively downloading, strip immediately
+                            if saved and current_state in ACTIVE_DOWNLOAD_STATES:
+                                self._strip_trackers(torrent_info)
 
-                # Active download → strip trackers
-                if (
-                    state in ACTIVE_DOWNLOAD_STATES
+                # ── State changed to active download → strip trackers ──
+                elif (
+                    new_state  # only react to actual state changes
+                    and new_state in ACTIVE_DOWNLOAD_STATES
                     and thash in self._saved_hashes
                     and thash not in self._stripped_hashes
                 ):
+                    log.info('🔔 State changed to "%s" for [hash: %s] → stripping trackers', new_state, thash[:8])
                     torrent_info = self._fetch_torrent_info(thash)
                     if torrent_info:
                         self._strip_trackers(torrent_info)
 
-                # Seeding → completion workflow
-                if (
-                    state in SEEDING_STATES
+                # ── State changed to seeding → completion workflow ──
+                elif (
+                    new_state  # only react to actual state changes
+                    and new_state in SEEDING_STATES
                     and thash in self._stripped_hashes
                     and thash not in self._completed_hashes
                     and self._db.get_pending(thash)
                 ):
-                    tname = tinfo.get("name", "?")
+                    tname = tinfo.get("name") or self._torrent_states.get(thash, "?")
                     self._complete_torrent(thash, tname)
 
             time.sleep(_SYNC_SLEEP)
