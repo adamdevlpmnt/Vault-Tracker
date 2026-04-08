@@ -2,8 +2,8 @@
 
 Logic (v3.0.1-dev):
     - Uses /api/v2/sync/maindata (rid-based delta sync) for real-time detection.
-    - On first sync (rid=0): processes ALL existing torrents (initial scan).
-    - New torrent detected (ANY state) → save tracker URLs + metadata + .torrent to DB.
+    - Initial scan: only processes torrents in DOWNLOAD states (ignores seeding).
+    - New torrent detected → save tracker URLs + metadata to DB (.torrent exported later).
     - Torrent enters "downloading" or "forcedDL" → strip tracker URLs instantly.
     - Torrent enters seeding state → delete torrent (keep files) → re-add .torrent
       with original save_path/category/tags → qBittorrent checks files → seeds
@@ -53,14 +53,7 @@ ALL_DOWNLOAD_STATES = frozenset({
     "moving",
 })
 
-# States to completely ignore (torrent not actionable)
-IGNORE_STATES = frozenset({
-    "error",
-    "missingFiles",
-    "unknown",
-})
-
-# Minimal sleep between sync calls to avoid CPU spin (100ms)
+# Minimal sleep between sync calls (100ms)
 _SYNC_SLEEP: float = 0.1
 
 
@@ -129,12 +122,9 @@ class VaultService:
             by_hash.setdefault(row["torrent_hash"], []).append(row)
 
         log.info(
-            "🔁 Container restart → resuming from database state, "
-            "%d torrent(s) with pending completions:",
+            "🔁 Container restart → %d torrent(s) with pending completions",
             len(by_hash),
         )
-        for thash, items in by_hash.items():
-            log.info("    ├── %s [hash: %s] — %d tracker(s)", items[0]["torrent_name"], thash[:8], len(items))
 
         try:
             torrents = self._qb.get_torrents()
@@ -146,123 +136,106 @@ class VaultService:
         for thash, items in by_hash.items():
             self._known_hashes.add(thash)
             self._saved_hashes.add(thash)
-            self._stripped_hashes.add(thash)
 
             t = torrent_map.get(thash)
             if not t:
+                log.info("    ├── %s [%s] — torrent no longer in qBittorrent", items[0]["torrent_name"], thash[:8])
                 continue
 
             state = t.get("state", "unknown")
+            log.info("    ├── %s [%s] [state: %s]", items[0]["torrent_name"], thash[:8], state)
 
-            # Torrent is seeding → run completion workflow
-            if state in SEEDING_STATES:
+            # Check if trackers are already stripped
+            try:
+                current_trackers = self._qb.get_torrent_trackers(thash)
+                real = QBittorrentClient.get_real_trackers(current_trackers)
+                if not real:
+                    self._stripped_hashes.add(thash)
+            except QBittorrentError:
+                pass
+
+            if state in SEEDING_STATES and thash in self._stripped_hashes:
                 self._complete_torrent(thash, t.get("name", "?"))
-            # Torrent is actively downloading but trackers still present → strip them
-            elif state in ACTIVE_DOWNLOAD_STATES:
+            elif state in ACTIVE_DOWNLOAD_STATES and thash not in self._stripped_hashes:
                 pending_trackers = self._db.get_pending(thash)
                 if pending_trackers:
                     urls = [url for url, _ in pending_trackers]
                     try:
                         self._qb.remove_trackers(thash, urls)
-                        log.info('✂️  Recovery: stripped %d tracker(s) from "%s"', len(urls), t.get("name", "?"))
+                        self._stripped_hashes.add(thash)
+                        log.info('    ↳ Recovery: stripped %d tracker(s)', len(urls))
                     except QBittorrentError as exc:
-                        log.error('✂️  Recovery: failed to strip trackers from "%s": %s', t.get("name", "?"), exc)
-
-    # ── process a single torrent (used by both initial scan & delta) ──
-
-    def _process_torrent(self, thash: str, state: str) -> None:
-        """Central logic to process a torrent based on its current state.
-
-        Called for:
-        - Every torrent in the initial scan
-        - New torrents appearing in sync deltas
-        - State changes detected in sync deltas
-        """
-        # ── Already completed → nothing to do ──
-        if thash in self._completed_hashes:
-            return
-
-        # ── Not yet saved to DB → save trackers + metadata ──
-        if thash not in self._saved_hashes:
-            # Torrent must be in some download-related state to be actionable
-            if state in IGNORE_STATES:
-                log.debug('   Torrent [%s] in state "%s" — ignoring', thash[:8], state)
-                return
-
-            torrent_info = self._fetch_torrent_info(thash)
-            if not torrent_info:
-                return
-
-            saved = self._save_trackers(torrent_info)
-            if not saved:
-                return  # skipped (size filter, no trackers, etc.)
-
-            # If already actively downloading → strip immediately
-            if state in ACTIVE_DOWNLOAD_STATES:
-                self._strip_trackers(torrent_info)
-            return
-
-        # ── Saved but not yet stripped → check if download started ──
-        if thash not in self._stripped_hashes:
-            if state in ACTIVE_DOWNLOAD_STATES:
-                log.info('🔔 Active download detected for [hash: %s] [state: %s] → stripping trackers', thash[:8], state)
-                torrent_info = self._fetch_torrent_info(thash)
-                if torrent_info:
-                    self._strip_trackers(torrent_info)
-            return
-
-        # ── Stripped, waiting for seeding → check if completed ──
-        if state in SEEDING_STATES and self._db.get_pending(thash):
-            tname = self._torrent_states.get(thash, "?")
-            # Try to get the name from torrent info
-            torrent_info = self._fetch_torrent_info(thash)
-            if torrent_info:
-                tname = torrent_info.get("name", tname)
-            self._complete_torrent(thash, tname)
+                        log.error('    ↳ Recovery: failed to strip trackers: %s', exc)
 
     # ── initial scan (first sync, rid=0) ──────────────────────────────
 
     def _initial_scan(self, torrents: Dict[str, Any]) -> None:
-        """Process all torrents from the first sync/maindata snapshot (rid=0)."""
+        """Process torrents from the first sync/maindata snapshot (rid=0).
+
+        IMPORTANT: Only processes torrents in download states.
+        Torrents already seeding are registered as known but NOT processed
+        (they already have their tracker URLs and are fine).
+        """
         if not torrents:
             log.info("🔍 Initial scan — no torrents in qBittorrent")
             return
 
-        log.info("🔍 Initial scan — %d torrent(s) in qBittorrent", len(torrents))
+        # Count states for summary
+        download_count = 0
+        seeding_count = 0
+        other_count = 0
 
         for thash, tinfo in torrents.items():
             state = tinfo.get("state", "unknown")
             self._known_hashes.add(thash)
             self._torrent_states[thash] = state
 
-            # Skip torrents already fully handled in DB
+            if state in ALL_DOWNLOAD_STATES:
+                download_count += 1
+            elif state in SEEDING_STATES:
+                seeding_count += 1
+            else:
+                other_count += 1
+
+        log.info(
+            "🔍 Initial scan — %d torrent(s): %d downloading, %d seeding, %d other",
+            len(torrents), download_count, seeding_count, other_count,
+        )
+
+        if download_count == 0:
+            log.info("🔍 No torrents in download states — nothing to process")
+            return
+
+        # Only process torrents in download states
+        processed = 0
+        for thash, tinfo in torrents.items():
+            state = tinfo.get("state", "unknown")
+
+            if state not in ALL_DOWNLOAD_STATES:
+                continue
+
+            # Skip if already in DB (already handled by recovery)
             if self._db.has_records(thash):
-                pending = self._db.get_pending(thash)
-                if not pending:
-                    # Already fully completed
-                    self._saved_hashes.add(thash)
-                    self._stripped_hashes.add(thash)
-                    self._completed_hashes.add(thash)
-                    log.debug('   Torrent [%s] already completed in DB — skipping', thash[:8])
-                    continue
-                else:
-                    # Has pending work — mark as saved and let _process_torrent handle it
-                    self._saved_hashes.add(thash)
-                    # If we know trackers were already stripped (no tracker URLs on torrent)
-                    # mark as stripped too
-                    try:
-                        current_trackers = self._qb.get_torrent_trackers(thash)
-                        real = QBittorrentClient.get_real_trackers(current_trackers)
-                        if not real:
-                            self._stripped_hashes.add(thash)
-                    except QBittorrentError:
-                        pass
+                self._saved_hashes.add(thash)
+                # Check if needs stripping
+                if state in ACTIVE_DOWNLOAD_STATES and thash not in self._stripped_hashes:
+                    torrent_info = self._fetch_torrent_info(thash)
+                    if torrent_info:
+                        self._strip_trackers(torrent_info)
+                continue
 
-            # Process the torrent through central logic
-            self._process_torrent(thash, state)
+            # Fetch full info and save
+            torrent_info = self._fetch_torrent_info(thash)
+            if not torrent_info:
+                continue
 
-        log.info("🔍 Initial scan complete — %d saved, %d stripped, %d completed",
-                 len(self._saved_hashes), len(self._stripped_hashes), len(self._completed_hashes))
+            saved = self._save_trackers(torrent_info)
+            if saved and state in ACTIVE_DOWNLOAD_STATES:
+                self._strip_trackers(torrent_info)
+
+            processed += 1
+
+        log.info("🔍 Initial scan complete — processed %d downloading torrent(s)", processed)
 
     # ── save trackers + metadata to DB ────────────────────────────────
 
@@ -277,19 +250,19 @@ class VaultService:
         # Size filter (0 = no filter)
         if self._cfg.MIN_SIZE_BYTES > 0 and size < self._cfg.MIN_SIZE_BYTES:
             log.info(
-                '🔍 Torrent "%s" [%s] — skipped (size %s < %s)',
+                '⏭️  Skipped: "%s" [%s] — size %s < %s',
                 tname, thash[:8], _format_size(size), self._cfg.min_size_display,
             )
             return False
 
         log.info(
-            '🆕 New torrent detected: "%s" [hash: %s] [size: %s] [state: %s]',
+            '🆕 New torrent: "%s" [%s] [size: %s] [state: %s]',
             tname, thash[:8], _format_size(size), state,
         )
 
         # Already in DB?
         if self._db.has_records(thash):
-            log.info('   ↳ Already processed in database — skipping')
+            log.info('   ↳ Already in database — skipping')
             self._saved_hashes.add(thash)
             return True
 
@@ -297,30 +270,30 @@ class VaultService:
         try:
             all_trackers = self._qb.get_torrent_trackers(thash)
         except QBittorrentError as exc:
-            log.error('❌ Failed to fetch trackers for "%s": %s', tname, exc)
+            log.error('   ↳ Failed to fetch trackers: %s', exc)
             return False
 
         real_trackers = QBittorrentClient.get_real_trackers(all_trackers)
 
         if not real_trackers:
-            log.info('   ↳ No tracker URLs found — nothing to do')
+            log.info('   ↳ No tracker URLs found — skipping')
             return False
 
-        # Export .torrent file
+        # Export .torrent file (non-critical: save without it if export fails)
         torrent_file: Optional[bytes] = None
         try:
             torrent_file = self._qb.export_torrent(thash)
-            log.info('   ↳ .torrent file exported (%d bytes)', len(torrent_file))
-        except QBittorrentError as exc:
-            log.warning('   ↳ Failed to export .torrent file: %s (will retry later)', exc)
+            log.info('   ↳ .torrent exported (%d bytes)', len(torrent_file))
+        except (QBittorrentError, Exception) as exc:
+            log.warning('   ↳ .torrent export failed: %s (will retry at completion)', exc)
 
-        # Extract metadata from torrent info
+        # Metadata
         save_path = torrent.get("save_path", "")
         content_path = torrent.get("content_path", "")
         category = torrent.get("category", "")
         tags = torrent.get("tags", "")
 
-        # Save each tracker URL with metadata
+        # Save each tracker URL
         for tracker in real_trackers:
             url = tracker["url"]
             tier = tracker.get("tier", 0)
@@ -335,18 +308,18 @@ class VaultService:
                 torrent_file=torrent_file,
             )
             if saved:
-                log.info("💾 Tracker URL saved: %s → ✅ OK", masked)
+                log.info("   💾 Saved: %s", masked)
             else:
-                log.info("💾 Tracker URL already in database: %s → ✅ OK (duplicate)", masked)
+                log.info("   💾 Already saved: %s", masked)
 
-        log.info('   ↳ %d tracker URL(s) saved — waiting for active download to strip', len(real_trackers))
+        log.info('   ↳ %d tracker(s) saved — waiting for active download to strip', len(real_trackers))
         self._saved_hashes.add(thash)
         return True
 
     # ── strip trackers (when active download starts) ──────────────────
 
     def _strip_trackers(self, torrent: Dict[str, Any]) -> None:
-        """Strip all saved tracker URLs from a torrent that has entered active download."""
+        """Strip all saved tracker URLs from a torrent in active download."""
         thash = torrent["hash"]
         tname = torrent.get("name", "unknown")
 
@@ -358,25 +331,20 @@ class VaultService:
         try:
             self._qb.remove_trackers(thash, urls_to_strip)
             self._stripped_hashes.add(thash)
-            log.info('✂️  Tracker(s) stripped from "%s" → ✅ OK (%d removed)', tname, len(urls_to_strip))
+            log.info('✂️  Stripped %d tracker(s) from "%s" → downloading without tracker', len(urls_to_strip), tname)
         except QBittorrentError as exc:
-            log.error('✂️  Failed to strip tracker(s) from "%s": %s → ❌ ERROR', tname, exc)
+            log.error('✂️  Failed to strip trackers from "%s": %s', tname, exc)
 
     # ── completion workflow (seeding → delete → re-add .torrent) ──────
 
     def _complete_torrent(self, thash: str, tname: str) -> None:
-        """Run the v3 completion workflow for a seeding torrent.
-
-        1. Export .torrent if not already stored in DB.
-        2. Delete torrent from qBittorrent (keep files).
-        3. Re-add .torrent with original save_path/category/tags.
-        4. Mark as completed in DB.
-        """
+        """Run the v3 completion workflow for a seeding torrent."""
         metadata = self._db.get_torrent_metadata(thash)
         if not metadata:
+            log.warning('⚠️  No metadata in DB for "%s" [%s] — cannot complete', tname, thash[:8])
             return
 
-        log.info('✅ Torrent completed, seeding state detected: "%s"', tname)
+        log.info('✅ Torrent completed: "%s" [%s] — starting re-add workflow', tname, thash[:8])
 
         # Step 1: Ensure we have the .torrent file
         torrent_file = metadata.get("torrent_file")
@@ -384,9 +352,9 @@ class VaultService:
             try:
                 torrent_file = self._qb.export_torrent(thash)
                 self._db.update_torrent_file(thash, torrent_file)
-                log.info('   ↳ .torrent file exported (%d bytes)', len(torrent_file))
+                log.info('   ↳ .torrent exported (%d bytes)', len(torrent_file))
             except QBittorrentError as exc:
-                log.error('❌ Failed to export .torrent for "%s": %s — cannot complete', tname, exc)
+                log.error('   ↳ Failed to export .torrent: %s — cannot complete', exc)
                 return
 
         save_path = metadata.get("save_path", "")
@@ -396,9 +364,9 @@ class VaultService:
         # Step 2: Delete torrent (keep files)
         try:
             self._qb.delete_torrent(thash, delete_files=False)
-            log.info('🗑️  Torrent deleted (files kept): "%s"', tname)
+            log.info('   🗑️  Deleted from qBittorrent (files kept)')
         except QBittorrentError as exc:
-            log.error('❌ Failed to delete torrent "%s": %s — cannot complete', tname, exc)
+            log.error('   ↳ Failed to delete torrent: %s — cannot complete', exc)
             return
 
         # Step 3: Re-add .torrent with original metadata
@@ -409,15 +377,15 @@ class VaultService:
                 category=category,
                 tags=tags,
             )
-            log.info('📥 .torrent re-added with original metadata: "%s" → ✅ OK', tname)
+            log.info('   📥 Re-added .torrent (save_path: %s, category: %s)', save_path, category or "none")
         except QBittorrentError as exc:
-            log.error('❌ Failed to re-add .torrent for "%s": %s', tname, exc)
+            log.error('   ↳ Failed to re-add .torrent: %s', exc)
             return
 
-        # Step 4: Mark completed in DB
+        # Step 4: Mark completed
         self._db.mark_completed(thash)
         self._completed_hashes.add(thash)
-        log.info('🎉 Completion workflow finished for "%s" [hash: %s]', tname, thash[:8])
+        log.info('   🎉 Done — torrent will check files and resume seeding with tracker')
 
     # ── main loop (real-time sync) ────────────────────────────────────
 
@@ -434,16 +402,17 @@ class VaultService:
         self._connect()
         self._recover_pending()
 
-        # First sync: full snapshot — process all existing torrents
-        log.info("⏳ Performing initial sync with qBittorrent…")
+        # First sync: full snapshot
+        log.info("⏳ Initial sync with qBittorrent…")
         try:
             data = self._qb.sync_maindata(rid=0)
             self._rid = data.get("rid", 0)
             initial_torrents = data.get("torrents", {})
             self._initial_scan(initial_torrents)
-            log.info("✅ Real-time monitoring active — watching for changes…")
-        except QBittorrentError:
-            log.warning("⚠️  Initial sync failed — will retry in main loop")
+        except QBittorrentError as exc:
+            log.warning("⚠️  Initial sync failed: %s — will retry in main loop", exc)
+
+        log.info("👁️  Real-time monitoring active — watching for changes…")
 
         while self._running:
             try:
@@ -462,36 +431,66 @@ class VaultService:
             torrents_delta = data.get("torrents", {})
             removed = data.get("torrents_removed", [])
 
-            # Clean up removed torrents from tracking sets
+            # Clean up removed torrents
             for rhash in removed:
                 self._known_hashes.discard(rhash)
                 self._saved_hashes.discard(rhash)
                 self._stripped_hashes.discard(rhash)
                 self._completed_hashes.discard(rhash)
                 self._torrent_states.pop(rhash, None)
-                log.info("🗑️  Torrent removed from qBittorrent [hash: %s]", rhash[:8])
+                log.info("🗑️  Torrent removed [%s]", rhash[:8])
 
-            # Process torrent updates from delta
+            # Process delta updates
             for thash, tinfo in torrents_delta.items():
-                # Update state tracking — delta may or may not include state
                 new_state = tinfo.get("state")
                 if new_state:
                     old_state = self._torrent_states.get(thash)
                     self._torrent_states[thash] = new_state
                     if old_state and old_state != new_state:
-                        log.debug('   State change [%s]: %s → %s', thash[:8], old_state, new_state)
+                        log.debug("   [%s] state: %s → %s", thash[:8], old_state, new_state)
 
                 current_state = self._torrent_states.get(thash, "unknown")
 
-                # ── New torrent in delta ──
+                # ── New torrent ──
                 if thash not in self._known_hashes:
                     self._known_hashes.add(thash)
-                    log.info("🔔 New torrent appeared [hash: %s] [state: %s]", thash[:8], current_state)
-                    self._process_torrent(thash, current_state)
+                    tname = tinfo.get("name", thash[:8])
+                    log.info("🔔 New torrent: \"%s\" [%s] [state: %s]", tname, thash[:8], current_state)
 
-                # ── Known torrent with state change ──
-                elif new_state:
-                    self._process_torrent(thash, new_state)
+                    # Save trackers immediately (fetch full info from API)
+                    torrent_info = self._fetch_torrent_info(thash)
+                    if torrent_info:
+                        saved = self._save_trackers(torrent_info)
+                        if saved and current_state in ACTIVE_DOWNLOAD_STATES:
+                            self._strip_trackers(torrent_info)
+                    continue
+
+                # ── State change on known torrent ──
+                if not new_state:
+                    continue  # no state change, just progress/speed update
+
+                # Skip already completed
+                if thash in self._completed_hashes:
+                    continue
+
+                # Saved but not stripped → check for active download
+                if thash in self._saved_hashes and thash not in self._stripped_hashes:
+                    if new_state in ACTIVE_DOWNLOAD_STATES:
+                        log.info('🔔 Download started [%s] [state: %s] → stripping tracker', thash[:8], new_state)
+                        torrent_info = self._fetch_torrent_info(thash)
+                        if torrent_info:
+                            self._strip_trackers(torrent_info)
+                    continue
+
+                # Stripped, waiting for seeding → check for completion
+                if thash in self._stripped_hashes and thash not in self._completed_hashes:
+                    if new_state in SEEDING_STATES:
+                        tname = tinfo.get("name") or "?"
+                        if tname == "?":
+                            ti = self._fetch_torrent_info(thash)
+                            if ti:
+                                tname = ti.get("name", "?")
+                        self._complete_torrent(thash, tname)
 
             time.sleep(_SYNC_SLEEP)
 
@@ -503,5 +502,5 @@ class VaultService:
         try:
             return self._qb.get_torrent_info(thash)
         except QBittorrentError as exc:
-            log.warning("⚠️  Failed to fetch torrent info for %s: %s", thash[:8], exc)
+            log.warning("⚠️  Failed to fetch info for [%s]: %s", thash[:8], exc)
         return None

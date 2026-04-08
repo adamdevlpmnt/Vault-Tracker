@@ -90,7 +90,7 @@ class QBittorrentClient:
         changes since the last call. Pass rid=0 for a full snapshot.
         Returns the parsed JSON response including 'rid', 'torrents', etc.
         """
-        resp = self._request("GET", "sync/maindata", params={"rid": rid})
+        resp = self._request("GET", "sync/maindata", params={"rid": rid}, timeout=30)
         return resp.json()
 
     # ── torrent operations ────────────────────────────────────────────
@@ -129,7 +129,7 @@ class QBittorrentClient:
         Returns the raw binary content of the .torrent file.
         """
         resp = self._request(
-            "GET", "torrents/export", params={"hash": torrent_hash}
+            "GET", "torrents/export", params={"hash": torrent_hash}, timeout=60
         )
         return resp.content
 
